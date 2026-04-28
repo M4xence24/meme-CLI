@@ -31,7 +31,7 @@ meme --render ascii --bw stonks
 ### 1. Cloner le repo
 
 ```bash
-git clone https://github.com/ton-username/meme-cli.git
+git clone https://github.com/M4xence24/meme-CLI.git
 cd meme-cli
 ```
 

@@ -1,0 +1,523 @@
+#!/usr/bin/env python3
+"""
+meme — Cherche et affiche des mèmes dans le terminal.
+"""
+
+import sys, os, json, difflib, subprocess, urllib.request, urllib.parse, re, ssl, shutil, base64, struct, zlib
+
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+SCRIPT_DIR   = os.path.dirname(os.path.realpath(__file__))
+LOCAL_DB     = os.path.join(SCRIPT_DIR, "meme_db.json")
+CACHE_DIR    = os.path.join(SCRIPT_DIR, ".meme_cache")
+FUZZY_CUTOFF = 0.45
+
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+G = "\033[92m"; Y = "\033[93m"; R = "\033[91m"
+C = "\033[96m"; W = "\033[0m";  B = "\033[1m"; DIM = "\033[2m"
+
+def info(m): print(f"{C}ℹ {m}{W}")
+def ok(m):   print(f"{G}✓ {m}{W}")
+def warn(m): print(f"{Y}⚠ {m}{W}")
+def err(m):  print(f"{R}✗ {m}{W}", file=sys.stderr)
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+}
+
+def http_get(url, timeout=10):
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", errors="ignore")
+
+def get_term_size():
+    try: cols, rows = os.get_terminal_size()
+    except OSError: cols, rows = 120, 40
+    return cols, rows
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RECHERCHE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_db():
+    if not os.path.exists(LOCAL_DB): return {}
+    with open(LOCAL_DB) as f: return json.load(f)
+
+def save_db(db):
+    with open(LOCAL_DB,"w") as f: json.dump(db, f, indent=2, ensure_ascii=False)
+
+def fuzzy_local(query, db):
+    if not db: return None
+    keys = list(db.keys()); q = query.lower()
+    if q in keys: return (q, 1.0)
+    m = difflib.get_close_matches(q, keys, n=1, cutoff=FUZZY_CUTOFF)
+    if m: return (m[0], difflib.SequenceMatcher(None, q, m[0]).ratio())
+    qw = set(q.split()); best_k, best_s = None, 0.0
+    for k in keys:
+        common = qw & set(k.split())
+        if common:
+            s = len(common) / max(len(qw), len(k.split()))
+            if s > best_s: best_s, best_k = s, k
+    return (best_k, best_s) if best_k and best_s >= 0.4 else None
+
+def search_ddg(query):
+    try:
+        q = urllib.parse.quote_plus(query + " meme")
+        html = http_get(f"https://duckduckgo.com/?q={q}&iax=images&ia=images")
+        vqd = None
+        for pat in [r'vqd=(["\'])?([\d-]+)', r'"vqd"\s*:\s*"([\d-]+)"', r"vqd=([\d-]+)&"]:
+            m = re.search(pat, html)
+            if m: vqd = m.group(m.lastindex); break
+        if not vqd: return None
+        h = dict(HEADERS); h["Referer"] = "https://duckduckgo.com/"
+        req = urllib.request.Request(
+            f"https://duckduckgo.com/i.js?q={q}&o=json&vqd={urllib.parse.quote(vqd)}&f=,,,,,&p=1",
+            headers=h)
+        with urllib.request.urlopen(req, timeout=10) as r: data = json.loads(r.read())
+        for item in data.get("results",[])[:10]:
+            u = item.get("image","")
+            if u and re.search(r'\.(jpg|jpeg|png|gif|webp)(\?|$)', u, re.I): return u
+        res = data.get("results",[])
+        return res[0].get("image") if res else None
+    except Exception as e: warn(f"DuckDuckGo : {e}"); return None
+
+def search_reddit(query):
+    q = urllib.parse.quote_plus(query)
+    for sub in ["memes","dankmemes","AdviceAnimals","me_irl"]:
+        try:
+            req = urllib.request.Request(
+                f"https://www.reddit.com/r/{sub}/search.json?q={q}&restrict_sr=1&sort=top&limit=5",
+                headers={"User-Agent":"meme-cli/1.0"})
+            with urllib.request.urlopen(req, timeout=8) as r: data = json.loads(r.read())
+            for post in data.get("data",{}).get("children",[]):
+                pd = post.get("data",{})
+                u = pd.get("url","")
+                if re.search(r'\.(jpg|jpeg|png|gif)$', u, re.I): return u
+                imgs = pd.get("preview",{}).get("images",[])
+                if imgs:
+                    src = imgs[0].get("source",{}).get("url","")
+                    if src: return src.replace("&amp;","&")
+        except: continue
+    return None
+
+def search_kym(query):
+    try:
+        html = http_get(f"https://knowyourmeme.com/search?q={urllib.parse.quote_plus(query)}")
+        m = re.search(r'href="(/memes/[a-z0-9-]+)"', html)
+        if not m: return None
+        html2 = http_get("https://knowyourmeme.com" + m.group(1))
+        img = re.search(r'<meta property="og:image" content="([^"]+)"', html2)
+        return img.group(1) if img else None
+    except Exception as e: warn(f"Know Your Meme : {e}"); return None
+
+def download_img(url, name):
+    ext = url.split("?")[0].rsplit(".",1)[-1].lower()
+    if ext not in ("jpg","jpeg","png","gif","webp"): ext = "jpg"
+    safe = re.sub(r"[^a-z0-9_-]","_", name.lower())[:60]
+    path = os.path.join(CACHE_DIR, f"{safe}.{ext}")
+    if os.path.exists(path): return path
+    try:
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=12) as r: data = r.read()
+        with open(path,"wb") as f: f.write(data)
+        return path
+    except Exception as e: err(f"Téléchargement échoué : {e}"); return None
+
+def find_image(query):
+    db = load_db()
+    r = fuzzy_local(query, db)
+    if r:
+        key, score = r
+        src = db[key]
+        warn(f"Correspondance locale : '{key}' ({int(score*100)}%)") if score < 1 else ok(f"Local : '{key}'")
+        if src.startswith("http"):
+            p = download_img(src, key)
+            if p: return p
+        elif os.path.exists(src): return src
+
+    info("Recherche DuckDuckGo Images…")
+    u = search_ddg(query)
+    if u: ok("Trouvé via DuckDuckGo"); return download_img(u, query)
+
+    info("Recherche sur Reddit…")
+    u = search_reddit(query)
+    if u: ok("Trouvé sur Reddit"); return download_img(u, query)
+
+    info("Recherche sur Know Your Meme…")
+    u = search_kym(query)
+    if u: ok("Trouvé sur Know Your Meme"); return download_img(u, query)
+
+    return None
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PILLOW HELPER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def ensure_pillow():
+    try: from PIL import Image; return True
+    except ImportError:
+        info("Installation de Pillow…")
+        for extra in [["--break-system-packages"], []]:
+            r = subprocess.run([sys.executable,"-m","pip","install","--quiet","--user","Pillow"]+extra, capture_output=True)
+            if r.returncode == 0:
+                ok("Pillow installé."); return True
+        return False
+
+def open_image(path, bw=False):
+    """Ouvre l'image avec Pillow, applique le fond blanc et optionnellement le NB."""
+    from PIL import Image
+    img = Image.open(path).convert("RGBA")
+    bg  = Image.new("RGBA", img.size, (255,255,255,255))
+    bg.paste(img, mask=img.split()[3])
+    img = bg.convert("RGB")
+    if bw:
+        img = img.convert("L").convert("RGB")
+    return img
+
+def _open_default(path):
+    if sys.platform == "darwin":   subprocess.run(["open", path])
+    elif sys.platform == "win32":  os.startfile(path)
+    else:                          subprocess.run(["xdg-open", path])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RENDERERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── PIXEL HD ─────────────────────────────────────────────────────────────────
+def _iterm2_inline(img_bytes, mime="image/png"):
+    """Protocole inline images iTerm2 — envoie les bytes bruts, terminal gère la résolution."""
+    b64 = base64.b64encode(img_bytes).decode()
+    size = len(img_bytes)
+    # ESC ] 1337 ; File=... ST
+    sys.stdout.buffer.write(
+        f"\033]1337;File=inline=1;size={size};width=auto;height=auto;preserveAspectRatio=1:{b64}\a\n"
+        .encode()
+    )
+    sys.stdout.buffer.flush()
+
+def _kitty_inline(img_bytes):
+    """Protocole graphique Kitty — envoie l'image PNG en chunks base64."""
+    b64 = base64.b64encode(img_bytes)
+    chunk = 4096
+    first = True
+    for i in range(0, len(b64), chunk):
+        part = b64[i:i+chunk]
+        more = 1 if i + chunk < len(b64) else 0
+        if first:
+            header = b"\033_Ga=T,f=100,m=" + str(more).encode() + b";" + part + b"\033\\"
+            first = False
+        else:
+            header = b"\033_Gm=" + str(more).encode() + b";" + part + b"\033\\"
+        sys.stdout.buffer.write(header)
+    sys.stdout.buffer.write(b"\n")
+    sys.stdout.buffer.flush()
+
+def _sixel_inline(path):
+    """Envoie l'image via img2sixel (qualité maximale, supporté par xterm/mlterm/foot)."""
+    cols, _ = get_term_size()
+    # largeur en pixels = colonnes * ~8px (estimation)
+    px_w = min(cols * 8, 1200)
+    subprocess.run(["img2sixel", "-w", str(px_w), path])
+
+def _wezterm_inline(path):
+    subprocess.run(["wezterm", "imgcat", "--width", "100%", path])
+
+def _imgcat_inline(path):
+    subprocess.run(["imgcat", path])
+
+def _viu_inline(path):
+    cols, rows = get_term_size()
+    subprocess.run(["viu", "-w", str(cols), "-h", str(rows-3), path])
+
+def _chafa_inline(path, bw=False):
+    cols, rows = get_term_size()
+    cmd = ["chafa", f"--size={cols}x{rows-3}", "--format=symbols",
+           "--color-space=din99d", "--dither=bayer", "--dither-grain=1x1"]
+    if bw:
+        cmd += ["--fg-only", "--palette=mono"]
+    cmd.append(path)
+    subprocess.run(cmd)
+
+def detect_term_graphics():
+    """Détecte les capacités graphiques du terminal courant."""
+    term     = os.environ.get("TERM","")
+    term_pgm = os.environ.get("TERM_PROGRAM","")
+    term_var = os.environ.get("TERMINAL_EMULATOR","")
+    lc_term  = os.environ.get("LC_TERMINAL","")
+    colorterm= os.environ.get("COLORTERM","")
+
+    if term == "xterm-kitty":                            return "kitty"
+    if term_pgm in ("iTerm.app",) or lc_term == "iTerm2": return "iterm2"
+    if "WezTerm" in term_var or term_pgm == "WezTerm":   return "wezterm"
+    if shutil.which("imgcat"):                            return "iterm2"
+    if shutil.which("img2sixel"):                        return "sixel"
+    if shutil.which("viu"):                              return "viu"
+    if shutil.which("chafa"):                            return "chafa"
+    if shutil.which("timg"):                             return "timg"
+    return "fallback"
+
+def render_pixel(path, bw=False):
+    """
+    Mode HD : envoie l'image brute au terminal via son protocole graphique natif.
+    Résolution identique à un navigateur — aucune dégradation en caractères.
+    Priorité : kitty → iTerm2 → WezTerm → sixel → viu → chafa → app système.
+    """
+    # Préparer l'image (BW si demandé) puis re-encoder en PNG pour les protocoles
+    if bw and ensure_pillow():
+        from PIL import Image
+        img = open_image(path, bw=True)
+        import io
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=False)
+        png_bytes = buf.getvalue()
+        # Écrire une version BW temporaire
+        tmp = os.path.join(CACHE_DIR, "_bw_tmp.png")
+        with open(tmp, "wb") as f: f.write(png_bytes)
+        src_path = tmp
+    else:
+        # Lire les bytes bruts directement
+        with open(path, "rb") as f: raw = f.read()
+        # Si c'est déjà un PNG/JPG, parfait. Sinon convertir.
+        if not (raw[:8] == b'\x89PNG\r\n\x1a\n' or raw[:2] == b'\xff\xd8'):
+            if ensure_pillow():
+                from PIL import Image
+                import io
+                img = Image.open(path).convert("RGB")
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                with open(path.replace(path.rsplit(".",1)[-1], "png"), "wb") as f2:
+                    f2.write(buf.getvalue())
+        src_path = path
+
+    cap = detect_term_graphics()
+
+    if cap == "kitty":
+        with open(src_path,"rb") as f: data = f.read()
+        if not data[:8] == b'\x89PNG\r\n\x1a\n':
+            if ensure_pillow():
+                from PIL import Image; import io
+                buf = io.BytesIO(); Image.open(src_path).convert("RGB").save(buf, "PNG")
+                data = buf.getvalue()
+        _kitty_inline(data)
+
+    elif cap in ("iterm2",):
+        with open(src_path,"rb") as f: data = f.read()
+        _iterm2_inline(data)
+
+    elif cap == "wezterm":
+        _wezterm_inline(src_path)
+
+    elif cap == "sixel":
+        _sixel_inline(src_path)
+
+    elif cap == "viu":
+        _viu_inline(src_path)
+
+    elif cap == "chafa":
+        _chafa_inline(src_path, bw=bw)
+
+    elif cap == "timg":
+        subprocess.run(["timg", src_path])
+
+    else:
+        warn("Aucun protocole graphique détecté → ouverture avec l'app par défaut")
+        _open_default(src_path)
+
+# ── EMOJI ─────────────────────────────────────────────────────────────────────
+def render_emoji(path, bw=False):
+    """Blocs ██ colorés 24-bit, 2 chars de large → ratio carré."""
+    if not ensure_pillow(): render_pixel(path, bw); return
+    img = open_image(path, bw)
+    cols, rows = get_term_size()
+    max_w = min(cols // 2, 80); max_h = rows - 4
+    w, h = img.size
+    scale = min(max_w/w, max_h/h)
+    img = img.resize((int(w*scale), int(h*scale)), __import__("PIL").Image.LANCZOS)
+    px = img.load()
+    lines = []
+    for y in range(img.height):
+        row = []
+        for x in range(img.width):
+            r2, g2, b2 = px[x, y]
+            row.append(f"\033[38;2;{r2};{g2};{b2}m██")
+        lines.append("".join(row) + "\033[0m")
+    print("\n".join(lines))
+
+# ── ASCII ─────────────────────────────────────────────────────────────────────
+def render_ascii(path, bw=False):
+    """Art ASCII coloré, 70 niveaux de luminosité, sharpen, luma Rec.709."""
+    if not ensure_pillow(): render_pixel(path, bw); return
+    from PIL import Image, ImageFilter
+    CHARS = ('$@B%8&WM#*oahkbdpqwmZO0QLCJUYXzcvunxrjft/|()1{}[]?-_+~<>i!lI;:,"^`\'. ')
+    img = open_image(path, bw).filter(ImageFilter.SHARPEN)
+    cols, rows = get_term_size()
+    max_w = min(cols, 200); max_h = (rows - 4) * 2
+    w, h = img.size
+    scale = min(max_w/w, max_h/(h*0.5))
+    new_w = int(w*scale); new_h = max(int(h*scale*0.5), 1)
+    rgb = img.resize((new_w, new_h), Image.LANCZOS)
+    gray = rgb.convert("L")
+    rp, gp = rgb.load(), gray.load()
+    n = len(CHARS)-1
+    lines = []
+    for y in range(new_h):
+        row = []
+        for x in range(new_w):
+            lum = gp[x,y]
+            ch = CHARS[int(lum/255*n)]
+            r2, g2, b2 = rp[x,y]
+            row.append(f"\033[38;2;{r2};{g2};{b2}m{ch}")
+        lines.append("".join(row)+"\033[0m")
+    print("\n".join(lines))
+
+# ── AUTO ──────────────────────────────────────────────────────────────────────
+def render_auto(path, bw=False):
+    """Détection automatique — même logique que pixel mais applique BW si demandé."""
+    if bw and ensure_pillow():
+        from PIL import Image; import io
+        img = open_image(path, bw=True)
+        tmp = os.path.join(CACHE_DIR, "_bw_tmp.png")
+        img.save(tmp, "PNG")
+        path = tmp
+    cap = detect_term_graphics()
+    if   cap == "kitty":   render_pixel(path)
+    elif cap == "iterm2":  _imgcat_inline(path) if shutil.which("imgcat") else render_pixel(path)
+    elif cap == "wezterm": _wezterm_inline(path)
+    elif cap == "sixel":   _sixel_inline(path)
+    elif cap == "viu":     _viu_inline(path)
+    elif cap == "chafa":   _chafa_inline(path, bw=bw)
+    elif shutil.which("timg"): subprocess.run(["timg", path])
+    else:
+        warn("Aucun renderer → ouverture avec l'app par défaut")
+        _open_default(path)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COMMANDES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def cmd_add(args):
+    if len(args) < 2: err("Usage : meme --add <nom> <url>"); sys.exit(1)
+    name = " ".join(args[:-1]).lower(); src = args[-1]
+    db = load_db(); db[name] = src; save_db(db)
+    ok(f"'{name}' ajouté à la base locale.")
+
+def cmd_list():
+    db = load_db()
+    if not db: info("Base locale vide. Utilisez --add pour ajouter des mèmes."); return
+    print(f"\n{B}Base locale ({len(db)} mèmes) :{W}")
+    for k in sorted(db): print(f"  {DIM}•{W} {k}")
+    print()
+
+HELP = f"""
+{B}meme{W} — Cherche et affiche des mèmes dans le terminal
+{DIM}════════════════════════════════════════════════════{W}
+
+{B}USAGE{W}
+  meme [OPTIONS] <recherche>
+  meme [COMMANDE]
+
+{B}OPTIONS D'AFFICHAGE{W}
+  {G}--render auto{W}    Détection automatique du meilleur renderer   {DIM}(défaut){W}
+  {G}--render pixel{W}   {B}Image HD native{W} via protocole graphique terminal
+                   → kitty protocol · iTerm2 inline · WezTerm · sixel
+                   → Résolution identique à un navigateur, aucune pixelisation
+  {G}--render emoji{W}   Mosaïque de blocs █ colorés (ratio carré)
+  {G}--render ascii{W}   Art ASCII coloré, 70 niveaux de luminosité
+  {G}--bw{W}             Noir et blanc (combinable avec tous les modes)
+
+{B}COMMANDES{W}
+  {G}--add <nom> <url>{W}   Ajoute un mème à la base locale
+  {G}--list{W}              Liste les mèmes de la base locale
+  {G}--help{W}, {G}-h{W}, {G}?{W}       Affiche cette aide
+
+{B}EXEMPLES{W}
+  meme stonks
+  meme "absolute cinema"
+  meme --render pixel "distracted boyfriend"
+  meme --render pixel --bw "this is fine"
+  meme --render emoji doge
+  meme --render ascii "two buttons"
+  meme --bw drake                            {DIM}# auto + noir et blanc{W}
+  meme --add "mon meme" https://example.com/img.jpg
+  meme --list
+
+{B}RECHERCHE{W}
+  Ordre : base locale → DuckDuckGo Images → Reddit → Know Your Meme
+  Tolérance aux fautes d'orthographe (distance de Levenshtein via difflib)
+
+{B}MODE PIXEL HD{W}
+  Utilise le protocole graphique natif du terminal pour afficher
+  l'image à sa résolution réelle — sans passer par des caractères.
+  Compatibilité détectée automatiquement :
+
+    {G}kitty{W}       TERM=xterm-kitty          brew install kitty
+    {G}iTerm2{W}      macOS, nativement          ou : brew install --cask iterm2
+    {G}WezTerm{W}     TERM_PROGRAM=WezTerm       brew install --cask wezterm
+    {G}Sixel{W}       xterm -ti vt340 / mlterm   brew install libsixel → img2sixel
+    {G}viu{W}         fallback multi-protocole   cargo install viu
+    {G}chafa{W}       fallback universel          brew install chafa
+
+{B}INSTALLATION RECOMMANDÉE (macOS){W}
+  brew install --cask iterm2      {DIM}# meilleur support pixel HD{W}
+  brew install chafa              {DIM}# fallback universel{W}
+  pip install pillow              {DIM}# auto-installé si absent{W}
+
+{B}INSTALLATION (Linux){W}
+  sudo apt install chafa libsixel-bin
+  pip install pillow
+
+{B}INSTALLATION (Windows){W}
+  winget install wez.wezterm      {DIM}# ou Windows Terminal (supporte pixel){W}
+  scoop install chafa
+  pip install pillow
+"""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or args[0] in ("--help", "-h", "?", "--?"):
+        print(HELP); return
+    if args[0] == "--add":  cmd_add(args[1:]); return
+    if args[0] == "--list": cmd_list(); return
+
+    # parse --render
+    render_mode = "auto"
+    if "--render" in args:
+        idx = args.index("--render")
+        if idx + 1 >= len(args): err("--render nécessite : auto|pixel|emoji|ascii"); sys.exit(1)
+        render_mode = args[idx+1]; args = args[:idx] + args[idx+2:]
+
+    # parse --bw
+    bw = "--bw" in args
+    if bw: args = [a for a in args if a != "--bw"]
+
+    if not args: print(HELP); return
+
+    query = " ".join(args)
+    bw_label = f" {Y}[bw]{W}" if bw else ""
+    print(f"\n{B}🔍 Recherche :{W} {query}  {C}[{render_mode}]{W}{bw_label}\n")
+
+    path = find_image(query)
+    if not path:
+        err(f"Aucun mème trouvé pour '{query}'.")
+        info("Essayez un terme en anglais ou plus court."); sys.exit(1)
+
+    print()
+    renderers = {"auto": render_auto, "pixel": render_pixel,
+                 "emoji": render_emoji, "ascii": render_ascii}
+    if render_mode not in renderers:
+        err(f"Mode inconnu : '{render_mode}'. Choix : auto · pixel · emoji · ascii"); sys.exit(1)
+    renderers[render_mode](path, bw=bw)
+    print(f"\n{G}📁 {path}{W}\n")
+
+if __name__ == "__main__":
+    main()
